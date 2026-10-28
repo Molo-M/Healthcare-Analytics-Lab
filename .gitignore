@@ -1,0 +1,24 @@
+# Operating system files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor settings
+.vscode/
+*.swp
+
+# Python (for the planned scripts/ folder)
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Credentials and local configuration (never commit database passwords)
+.env
+
+# MySQL Workbench backup files
+*.mwb.bak
+
+# Generated synthetic data (large; rebuild it with the generator script)
+data/generated/
+*.sql.gz
