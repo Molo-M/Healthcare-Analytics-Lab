@@ -1,0 +1,256 @@
+HEALTHCARE ANALYTICS LAB - PART 3.3: STAR SCHEMA QUERIES
+================================================================
+
+The star schema lives in the data warehouse database healthanalyticsdw
+(the "OLAP" side of this repository). Each query below answers the same
+question as its OLTP version in query_analysis.txt.
+
+Measurement method
+- Same data in both schemas: the OLTP database holds the brief's sample
+  data plus the deterministic synthetic data from
+  sql/oltp/03_synthetic_data.sql (200,004 encounters, 464,820 diagnosis
+  rows, 281,773 procedure rows, 189,882 claims). The warehouse was
+  loaded from it with the ETL scripts in sql/olap/etl/.
+- Each query was measured with a single EXPLAIN ANALYZE run in MySQL
+  Workbench (MySQL 8.0, on a laptop). Execution time = total "actual
+  time" on the top line of the plan, the same method as
+  query_analysis.txt.
+  Plans: results/oltp_explain_analyze/ and results/olap_explain_analyze/.
+- Two caveats on the timings:
+    - A single run per query; repeated runs of the same query vary.
+    - EXPLAIN ANALYZE adds timing overhead to every step, so absolute
+      milliseconds are approximate.
+  The rows-read comparison below is exact and does not depend on the
+  machine, so it is the most reliable measure of the work saved.
+- Correctness: on this data each star query returns exactly the same
+  rows as its OLTP query (672, 7,493, 9 and 240 rows respectively), so
+  each speedup compares identical answers.
+
+Summary
+
+  Question                          OLTP        Star       Speedup
+  --------------------------------  ----------  ---------  -------
+  Q1 Monthly encounters by spec.     2,910 ms     219 ms     13.3x
+  Q2 Top diagnosis-procedure pairs  12,757 ms   1,858 ms      6.9x
+  Q3 30-day readmission rate         2,672 ms    19.3 ms      138x
+  Q4 Revenue by specialty & month    2,798 ms     164 ms     17.1x
+
+  Rows read from tables and indexes (rows x loops, from the plans):
+
+  Question   OLTP        Star        Reduction
+  ---------  ----------  ----------  ---------
+  Q1           600,012     201,352      3.0x
+  Q2         1,799,001   1,047,931      1.7x
+  Q3           626,446      32,451     19.3x
+  Q4           759,528     200,255      3.8x
+
+  The speedups are larger than the row reductions because the star
+  queries also do cheaper work per row: covering-index reads instead
+  of random primary-key lookups, integer keys instead of DATE_FORMAT,
+  and no COUNT(DISTINCT) in Q2 and Q3.
+
+Two techniques are used in every star query:
+- Aggregate first, label last. The fact table is grouped using its
+  integer keys only; the dimension tables are joined afterwards to the
+  few hundred aggregated rows to turn keys into names. The joins still
+  exist, but they run hundreds of times instead of hundreds of
+  thousands of times.
+- Covering indexes. Each query is served entirely from an index that
+  contains every column it reads, so table rows are never fetched.
+
+________________________________________________________________
+
+QUESTION 1: Monthly Encounters by Specialty
+
+SQL (sql/olap/queries/q1_monthly_encounters.sql):
+SELECT
+    d.month_start_date     AS encounter_month,
+    s.specialty_name,
+    t.encounter_type_name  AS encounter_type,
+    agg.total_encounters,
+    agg.unique_patients
+FROM (
+    SELECT f.encounter_date_key DIV 100       AS month_key,
+           f.specialty_key,
+           f.encounter_type_key,
+           COUNT(*)                           AS total_encounters,
+           COUNT(DISTINCT f.patient_key)      AS unique_patients
+    FROM fact_encounters f
+    GROUP BY month_key, f.specialty_key, f.encounter_type_key
+) agg
+LEFT JOIN dim_date      d ON d.date_key           = agg.month_key * 100 + 1
+JOIN dim_specialty      s ON s.specialty_key      = agg.specialty_key
+JOIN dim_encounter_type t ON t.encounter_type_key = agg.encounter_type_key
+ORDER BY encounter_month, s.specialty_name, encounter_type;
+
+Execution time: ~219 ms vs. 2,910 ms original
+Improvement:    13.3x faster
+
+Why it is faster:
+1. Fewer lookups. The OLTP query looked up the provider and then the
+   specialty for every one of 200,004 encounters (400,008 primary-key
+   lookups, about half of its runtime) before it could group
+   anything. specialty_key is stored on the fact row, so the star query
+   groups directly. It joins three dimensions (one more than the OLTP
+   query), but only to the 672 aggregated rows: about 2,000 lookups
+   instead of 400,008, taking about 3 ms in total.
+2. No date function per row. The OLTP query computed DATE_FORMAT on
+   every encounter (about 535 ms in its "Stream results" step). Here
+   the month is encounter_date_key DIV 100 (YYYYMMDD -> YYYYMM),
+   simple integer arithmetic on the date key.
+3. Covering index. idx_fact_q1_date_spec_type_patient contains every
+   column the query needs (date key, specialty, type, patient), so it
+   is an index-only scan: fact table rows are never read. The scan of
+   all 200,004 entries takes 71 ms, compared with 1,452 ms for the
+   OLTP scan plus lookups. (The EXPLAIN ANALYZE tree labels it "Index
+   scan"; plain EXPLAIN confirms it with "Using index" in the Extra
+   column.)
+
+What did not improve: the sort and COUNT(DISTINCT patient_key) over
+200,004 rows remain (about 145 of the 219 ms: 104 ms sorting, 41 ms
+aggregating), because unique patients is not additive and cannot be
+pre-summed. A monthly aggregate table would remove this cost if Q1 ran
+very frequently.
+
+________________________________________________________________
+
+QUESTION 2: Top Diagnosis-Procedure Pairs
+
+SQL (sql/olap/queries/q2_diagnosis_procedure_pairs.sql):
+SELECT
+    dd.icd10_code,
+    dp.cpt_code,
+    pairs.encounter_count
+FROM (
+    SELECT /*+ JOIN_ORDER(bp, bd) */
+           bd.diagnosis_key,
+           bp.procedure_key,
+           COUNT(*) AS encounter_count
+    FROM bridge_encounter_procedures bp
+    JOIN bridge_encounter_diagnoses  bd ON bd.encounter_id = bp.encounter_id
+    GROUP BY bd.diagnosis_key, bp.procedure_key
+) pairs
+JOIN dim_diagnosis dd ON dd.diagnosis_key = pairs.diagnosis_key
+JOIN dim_procedure dp ON dp.procedure_key = pairs.procedure_key
+ORDER BY pairs.encounter_count DESC, dd.icd10_code, dp.cpt_code;
+
+Execution time: ~1,858 ms vs. 12,757 ms original
+Improvement:    6.9x faster
+
+Why it is faster:
+1. No code lookups before counting. The OLTP query translated every
+   pair row into an ICD-10 code (758,564 diagnosis lookups, about
+   2.4 seconds) before grouping. The star query counts pairs by
+   surrogate keys and looks up codes only for the 7,493 distinct pairs
+   in the result.
+2. Clustered, covering bridge access. Both bridges have primary keys
+   starting with encounter_id, so the join is a "Covering index lookup
+   on bd using PRIMARY": each encounter's diagnoses are read from
+   adjacent index entries with no extra row fetch. Building the
+   758,564 pairs took about 1.36 seconds, compared with about
+   7.3 seconds in the OLTP plan, which used a secondary index on
+   encounter_id and then had to fetch each row to get its diagnosis_id.
+3. No COUNT(DISTINCT) and no 758,564-row sort. The ETL removed
+   duplicate (encounter, code) rows, so COUNT(*) per pair already
+   counts distinct encounters, and the pairs are grouped in a
+   temporary table (about 465 ms). The OLTP query had to sort all
+   758,564 rows by code (about 1.7 seconds) and deduplicate encounters
+   inside each group.
+4. A stable join order. The JOIN_ORDER hint makes MySQL start from the
+   smaller bridge (281,773 procedure rows) and look up diagnoses by
+   primary key, as the plan shows. During development testing, MySQL
+   sometimes chose the larger diagnoses bridge (464,820 rows) right
+   after a fresh load, which was about 40% slower. The hint makes the
+   good plan the only plan.
+
+What did not improve: the row explosion. Joining the two bridges still
+produces 758,564 diagnosis x procedure rows from 281,773 procedure
+rows, exactly as in the OLTP schema; this is why Q2 gains the least.
+Removing it would require a pre-aggregated pair table maintained by
+the ETL (see design_decisions.txt, Decision 4).
+
+________________________________________________________________
+
+QUESTION 3: 30-Day Readmission Rate
+
+SQL (sql/olap/queries/q3_readmission_rate.sql):
+SELECT
+    s.specialty_name,
+    agg.inpatient_discharges,
+    agg.readmissions,
+    ROUND(100 * agg.readmissions / agg.inpatient_discharges, 2) AS readmission_rate_pct
+FROM (
+    SELECT f.specialty_key,
+           COUNT(*)                     AS inpatient_discharges,
+           SUM(f.readmitted_within_30d) AS readmissions
+    FROM fact_encounters f
+    JOIN dim_encounter_type t ON t.encounter_type_key = f.encounter_type_key
+    WHERE t.is_inpatient = TRUE
+    GROUP BY f.specialty_key
+) agg
+JOIN dim_specialty s ON s.specialty_key = agg.specialty_key
+ORDER BY readmission_rate_pct DESC;
+
+Execution time: ~19.3 ms vs. 2,672 ms original
+Improvement:    138x faster
+
+Why it is faster:
+1. The self-join is gone. The OLTP query fetched every encounter of
+   each inpatient's patient (32,436 stays x ~11 encounters = 356,796
+   rows) and checked the 30-day window row by row, on every run; that
+   step alone took about 1.9 seconds. The ETL computed
+   readmitted_within_30d once per stay, so the query only sums a 0/1
+   flag. This is the largest gain because the most expensive work moved
+   out of query time entirely.
+2. No full table scan to find inpatient stays. The OLTP query read all
+   200,004 encounters and filtered on the encounter_type string (no
+   index), which took 313 ms. Here dim_encounter_type supplies the
+   inpatient key, and the covering index idx_fact_q3_type_spec_readmit
+   (type, specialty, flag) jumps straight to the 32,436 inpatient
+   entries in under 9 ms.
+3. No join chain and no COUNT(DISTINCT). specialty_key is on the fact
+   row and each stay is exactly one fact row, so COUNT(*) and SUM()
+   replace the four COUNT(DISTINCT) expressions of the OLTP query.
+
+Result (identical in both schemas): Cardiology has the highest rate,
+34.34% (1,232 of 3,588 stays). With synthetic data the rates are
+similar across specialties (32-34%); they demonstrate the method only.
+
+________________________________________________________________
+
+QUESTION 4: Revenue by Specialty & Month
+
+SQL (sql/olap/queries/q4_revenue_by_specialty.sql):
+SELECT
+    d.month_start_date  AS encounter_month,
+    s.specialty_name,
+    agg.total_allowed
+FROM (
+    SELECT f.encounter_date_key DIV 100   AS month_key,
+           f.specialty_key,
+           SUM(f.total_allowed_amount)    AS total_allowed
+    FROM fact_encounters f
+    WHERE f.claim_count > 0
+    GROUP BY month_key, f.specialty_key
+) agg
+LEFT JOIN dim_date d ON d.date_key      = agg.month_key * 100 + 1
+JOIN dim_specialty s ON s.specialty_key = agg.specialty_key
+ORDER BY encounter_month, agg.total_allowed DESC;
+
+Execution time: ~164 ms vs. 2,798 ms original
+Improvement:    17.1x faster
+
+Why it is faster:
+1. The JOIN chain disappears. The OLTP query followed
+   billing -> encounters -> providers -> specialties: three primary-key
+   lookups for each of 189,882 claims (569,646 lookups, about 68% of
+   its runtime) before summing. In the star schema, the allowed amount
+   was summed per encounter by the ETL (total_allowed_amount) and the
+   specialty is already on the fact row, so the query reads one table.
+2. Covering index. idx_fact_q4_date_spec_allowed holds the date key,
+   specialty, claim count and allowed amount, so the plan is a single
+   "Covering index scan" of the fact table (60 ms for 200,004 entries).
+3. Cheaper grouping. The month comes from the date key (DIV 100)
+   instead of DATE_FORMAT, and the temporary-table aggregation groups
+   two integer keys (about 92 ms, compared with about 900 ms in the
+   OLTP plan). Labels are joined to the 240 aggregated rows only.
