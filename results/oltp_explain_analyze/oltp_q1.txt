@@ -1,0 +1,8 @@
+-> Group aggregate: count(0), count(distinct encounters.patient_id)  (actual time=2613..2910 rows=672 loops=1)
+    -> Sort: encounter_month, sp.specialty_name, en.encounter_type  (actual time=2613..2650 rows=200004 loops=1)
+        -> Stream results  (cost=159771 rows=199483) (actual time=1.86..1987 rows=200004 loops=1)
+            -> Nested loop left join  (cost=159771 rows=199483) (actual time=1.84..1452 rows=200004 loops=1)
+                -> Nested loop left join  (cost=89952 rows=199483) (actual time=1.04..965 rows=200004 loops=1)
+                    -> Table scan on en  (cost=20133 rows=199483) (actual time=0.528..282 rows=200004 loops=1)
+                    -> Single-row index lookup on pr using PRIMARY (provider_id=en.provider_id)  (cost=0.25 rows=1) (actual time=0.00302..0.00307 rows=1 loops=200004)
+                -> Single-row index lookup on sp using PRIMARY (specialty_id=pr.specialty_id)  (cost=0.25 rows=1) (actual time=0.00206..0.00211 rows=1 loops=200004)

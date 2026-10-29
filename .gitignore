@@ -7,7 +7,7 @@ desktop.ini
 .vscode/
 *.swp
 
-# Python (for the planned scripts/ folder)
+# Python (in case helper scripts are added later)
 __pycache__/
 *.pyc
 .venv/
@@ -19,6 +19,6 @@ venv/
 # MySQL Workbench backup files
 *.mwb.bak
 
-# Generated synthetic data (large; rebuild it with the generator script)
+# Exported data dumps (large; rebuild the data with sql/oltp/03_synthetic_data.sql)
 data/generated/
 *.sql.gz

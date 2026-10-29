@@ -1,0 +1,250 @@
+HEALTHCARE ANALYTICS LAB - PART 3.1: STAR SCHEMA DESIGN DECISIONS
+================================================================
+
+The design follows Kimball's four-step process: choose the business
+process (patient encounters), declare the grain, identify the
+dimensions, then identify the facts. It is driven by the four business
+questions from Part 2:
+
+  Q1  Monthly encounters and unique patients by specialty and type
+  Q2  Most common diagnosis-procedure pairs
+  Q3  30-day readmission rate by specialty
+  Q4  Allowed amount (revenue) by specialty and month
+
+The warehouse lives in its own database, healthanalyticsdw, separate
+from the OLTP database healthanalyticsdb. The full DDL is in
+star_schema.sql.
+
+________________________________________________________________
+
+DECISION 1: FACT TABLE GRAIN
+________________________________________________________________
+
+Choice: Option A - one row per encounter.
+
+Why this grain fits the four questions:
+
+- Q1, Q3 and Q4 are all asked at the encounter level: they count
+  encounters, count patients, flag inpatient stays, and sum billing per
+  encounter. With one row per encounter, each answer is a single scan
+  and GROUP BY of the fact table.
+
+- Option B (one row per diagnosis) or Option C (one row per procedure)
+  would repeat every encounter once per diagnosis or procedure. Any
+  encounter-level measure on those rows is double counted: an
+  encounter with 3 diagnoses and a 10,000 allowed amount would appear
+  as 30,000 in Q4 unless every query remembered to deduplicate. Q1
+  would need COUNT(DISTINCT encounter_id) instead of a plain count.
+  This is the fan-out (double-counting) trap. Kimball's rule is that a
+  fact table must not mix grains, so encounter-level facts cannot
+  safely live on diagnosis- or procedure-level rows.
+
+- Only Q2 needs diagnosis and procedure detail. That detail is kept
+  in two bridge tables (Decision 4) instead of changing the grain of
+  the whole fact table for one question.
+
+- The grain matches how the business thinks: an encounter is the unit
+  that is scheduled, treated, discharged and billed.
+
+Consequence: billing (which can have several claims per encounter) is
+rolled up to the encounter during ETL (claim_count, total_claim_amount,
+total_allowed_amount). Claim-level analysis (for example by claim
+status or claim date) would need a separate fact_claims table at claim
+grain; it is not needed for these four questions.
+
+________________________________________________________________
+
+DECISION 2: DIMENSION TABLES
+________________________________________________________________
+
+General rules for every dimension:
+- Surrogate primary key (*_key, AUTO_INCREMENT integer). The OLTP
+  natural key (*_id) is kept as an attribute, so every warehouse row
+  can be traced back to its source.
+- An "Unknown" row with key -1. When a source value is missing, the
+  fact row points at -1 instead of NULL, so no encounter disappears
+  from an inner join and missing data stays visible in reports.
+- Business codes that people recognise (MRN, ICD-10, CPT) are kept as
+  attributes for reporting.
+
+1. dim_date (one row per day, 2020-01-01 to 2030-12-31)
+   date_key (YYYYMMDD, e.g. 20240510), full_date, day_of_month,
+   day_of_week, day_name, is_weekend, week_of_year, month_number,
+   month_name, month_start_date, month_label ('2024-05'),
+   calendar_quarter, quarter_label ('2024-Q2'), calendar_year.
+   - Role-playing dimension: the fact table references it twice, as
+     encounter_date_key and discharge_date_key.
+   - The date key is a "smart key" in YYYYMMDD form, the one accepted
+     exception to meaningless surrogate keys. Its main benefit here:
+     encounter_date_key DIV 100 gives YYYYMM, so monthly queries can
+     group the fact table by month without calling DATE_FORMAT on
+     every row and without joining dim_date first.
+   - Month and quarter labels are precomputed once instead of being
+     derived at query time.
+
+2. dim_patient (SCD Type 1)
+   patient_key, patient_id, mrn, first_name, last_name, full_name,
+   gender, date_of_birth, age_group ('0-17', '18-34', '35-49',
+   '50-64', '65-79', '80+').
+   - age_group reflects the patient's age when the ETL last ran. Age
+     at the time of each visit belongs to the encounter, so it is
+     stored on the fact row (patient_age_at_encounter).
+
+3. dim_provider (SCD Type 2 on specialty and department)
+   provider_key, provider_id, first_name, last_name, full_name,
+   credential, specialty_key, specialty_name, department_key,
+   department_name, effective_from, effective_to, is_current.
+   - Type 2 because a provider's specialty or department can change,
+     and Q1, Q3 and Q4 report by specialty. If Dr. Chen moves from
+     Cardiology to Internal Medicine, his past encounters must still
+     count toward Cardiology. A change closes the current row and adds
+     a new version; each fact row points at the version that was valid
+     on the encounter date.
+   - Name and credential are Type 1: they are corrections, not
+     history, so they overwrite every version.
+   - specialty_name and department_name are copied in (denormalized)
+     so provider-level reports need no extra join.
+
+4. dim_specialty (SCD Type 1)
+   specialty_key, specialty_id, specialty_name, specialty_code.
+
+5. dim_department (SCD Type 1)
+   department_key, department_id, department_name, floor_number,
+   bed_capacity.
+
+6. dim_encounter_type
+   encounter_type_key, encounter_type_name ('Outpatient', 'Inpatient',
+   'ER'), is_inpatient.
+   - A tiny dimension, but it gives filters a clean flag (is_inpatient)
+     instead of string comparisons, and new types can be added without
+     touching the fact table.
+
+7. dim_diagnosis (new)
+   diagnosis_key, diagnosis_id, icd10_code, icd10_description,
+   icd10_category (first 3 characters, e.g. I50.9 -> I50, for roll-ups).
+
+8. dim_procedure (new)
+   procedure_key, procedure_id, cpt_code, cpt_description.
+
+Star vs. snowflake decision: the fact table stores specialty_key and
+department_key directly, instead of reaching specialty through
+dim_provider (fact -> provider -> specialty would be a snowflake and
+would recreate the OLTP join chain). The ETL copies the provider's
+specialty at encounter time onto each fact row. dim_provider also
+carries the specialty and department names for convenience; queries
+should group by the fact table's own keys.
+
+Not a dimension: encounter_id is kept on the fact table as a
+degenerate dimension. It has no descriptive attributes of its own, so
+a separate dim_encounter table would only add a 1:1 join. It is the
+fact table's primary key and the link to the bridge tables.
+
+________________________________________________________________
+
+DECISION 3: PRE-AGGREGATED METRICS
+________________________________________________________________
+
+Stored on each fact row (computed once by the ETL):
+
+  Metric                    Source / rule                   Used by
+  ------------------------  ------------------------------  --------
+  encounter_count           always 1; SUM() = encounters    Q1
+  diagnosis_count           distinct diagnoses per encounter general
+  procedure_count           distinct procedures per enc.    general
+  claim_count               claims per encounter            Q4 filter
+  total_claim_amount        SUM(billing.claim_amount)       general
+  total_allowed_amount      SUM(billing.allowed_amount)     Q4
+  readmitted_within_30d     1 if an inpatient stay is       Q3
+                            followed by any encounter of
+                            the same patient within 30 days
+                            of discharge, else 0
+  days_to_next_encounter    days from discharge to the next Q3 detail
+                            encounter (inpatient only)
+  length_of_stay_hours      discharge - admission           general
+  patient_age_at_encounter  age on the encounter date       general
+
+Why pre-aggregating helps performance:
+
+1. It removes joins from every query. Q4 in the OLTP schema joins
+   billing -> encounters -> providers -> specialties: three primary-
+   key lookups for each of ~190,000 claims (about 570,000 lookups) on
+   every run. With total_allowed_amount and specialty_key on the fact
+   row, the same answer comes from one covering index scan of the fact
+   table and no joins before grouping.
+
+2. It removes the most expensive operation entirely. Q3's OLTP query
+   self-joins encounters: each of ~32,000 inpatient stays fetches all
+   of that patient's encounters (~11 each, ~357,000 rows) and checks
+   the 30-day window row by row. readmitted_within_30d does that work
+   once in the ETL; the query just sums a 0/1 flag. Measured:
+   2,672 ms -> 19.3 ms (138x).
+
+3. The work moves from query time to load time. The ETL pays the cost
+   once per encounter; every report, dashboard and analyst query after
+   that reads the stored result. Analytical workloads read far more
+   often than they load, so this trade is worth it.
+
+4. All stored metrics are additive (or 0/1 flags, which are additive),
+   so they can be safely summed across any dimension. Rates such as
+   the readmission rate are non-additive, so the rate itself is NOT
+   stored: the query sums the additive parts (readmissions and
+   discharges) and divides at the end, which is Kimball's recommended
+   way to handle non-additive measures.
+
+________________________________________________________________
+
+DECISION 4: BRIDGE TABLES
+________________________________________________________________
+
+Choice: yes - bridge_encounter_diagnoses and
+bridge_encounter_procedures.
+
+Why:
+
+1. Diagnoses and procedures are genuinely many-to-many with
+   encounters. An inpatient stay in the test data has 2-6 diagnoses
+   and 1-5 procedures. They cannot become single columns on a
+   one-row-per-encounter fact table without either losing data
+   (keeping only the primary diagnosis) or breaking the grain.
+
+2. Putting them in the fact table would cause double counting. Adding
+   diagnosis rows to the fact table multiplies every encounter-level
+   measure (revenue, encounter counts) by the number of diagnoses. The
+   bridges keep the multiplication isolated: only Q2, which actually
+   wants diagnosis-procedure combinations, joins them.
+
+3. They keep the clean grain from Decision 1, so Q1, Q3 and Q4 never
+   touch diagnosis or procedure rows at all.
+
+Design details:
+- Primary keys (encounter_id, diagnosis_key) and (encounter_id,
+  procedure_key). Because InnoDB stores rows in primary-key order,
+  each encounter's diagnoses (and procedures) are physically stored
+  together, so joining the two bridges on encounter_id reads
+  neighbouring index entries instead of random rows. Secondary
+  indexes on (diagnosis_key, encounter_id) and (procedure_key,
+  encounter_id) support "which encounters had X" questions.
+- The ETL collapses duplicate (encounter, code) rows, so in Q2
+  COUNT(*) per pair equals the number of distinct encounters and the
+  expensive COUNT(DISTINCT) is no longer needed.
+- is_primary (diagnosis_sequence = 1) identifies the principal
+  diagnosis; procedure_quantity keeps repeat counts.
+- No weighting factor. Kimball's bridge pattern allows a weight so a
+  measure such as revenue can be split across an encounter's
+  diagnoses, but in healthcare there is rarely an agreed rule for that
+  split. When one diagnosis per encounter is needed, is_primary is
+  used instead.
+- Simplification: these are encounter-level bridges (each encounter
+  links directly to its codes). Kimball's full pattern uses a
+  "diagnosis group" key so identical sets of diagnoses are stored
+  once; that saves space at very large scale but adds ETL complexity
+  that this project does not need.
+
+Trade-off acknowledged: the bridge join in Q2 still produces one row
+per diagnosis x procedure within each encounter (758,564 pair rows on
+the test data), the same row explosion as in the OLTP schema. The star
+version is faster because of clustering, covering indexes and the
+removal of COUNT(DISTINCT), not because the explosion disappears. If
+Q2 were run constantly in production, a pre-aggregated summary table
+of pair counts (refreshed by the ETL) would remove the explosion from
+query time entirely.
