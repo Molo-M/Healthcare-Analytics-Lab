@@ -119,11 +119,13 @@ General rules for every dimension:
      instead of string comparisons, and new types can be added without
      touching the fact table.
 
-7. dim_diagnosis (new)
+7. dim_diagnosis (added: answers the brief's "Others?" question;
+   loaded from the OLTP diagnoses table)
    diagnosis_key, diagnosis_id, icd10_code, icd10_description,
    icd10_category (first 3 characters, e.g. I50.9 -> I50, for roll-ups).
 
-8. dim_procedure (new)
+8. dim_procedure (added: answers the brief's "Others?" question;
+   loaded from the OLTP procedures table)
    procedure_key, procedure_id, cpt_code, cpt_description.
 
 Star vs. snowflake decision: the fact table stores specialty_key and
